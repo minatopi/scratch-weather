@@ -1,7 +1,7 @@
 
-import json
 import os
 import time
+import json
 import threading
 import urllib.parse
 import urllib.request
@@ -12,7 +12,10 @@ from flask import Flask, jsonify
 
 app = Flask(__name__)
 
-# Renderの環境変数
+# =====================================
+# 環境変数
+# =====================================
+
 PORT = int(os.environ.get("PORT", "10000"))
 
 PROJECT_ID = os.environ["SCRATCH_PROJECT_ID"]
@@ -22,25 +25,42 @@ SESSION_ID = os.environ["SCRATCH_SESSION_ID"]
 WEATHER_API_URL = os.environ["WEATHER_API_URL"].rstrip("/")
 WEATHER_API_SECRET = os.environ["WEATHER_API_SECRET"]
 
-# Scratchのクラウド変数名（☁ は付けない）
+# =====================================
+# Scratchのクラウド変数名
+# =====================================
+
 REQUEST_VAR = "req"
 CITY_VAR = "city"
 DONE_VAR = "done"
 
-# 状態確認ページ用
+RESULT_VARS = ["current", "day1", "day2", "day3"]
+
+# =====================================
+# 状態管理
+# =====================================
+
 status = {
     "web": True,
     "scratch_connected": False,
     "last_connected": None,
+    "last_event": None,
     "last_request": None,
     "last_success": None,
     "last_error": None,
-    "message": "Scratchへの接続待ち",
+    "message": "起動中",
 }
 
 status_lock = threading.Lock()
 request_lock = threading.Lock()
+
+# 同一プロセス内での重複処理を防止
 last_request_id = None
+
+
+def log(message):
+    """時刻付きログ"""
+    now = datetime.now(timezone.utc).isoformat()
+    print(f"[{now}] {message}", flush=True)
 
 
 def update_status(**kwargs):
@@ -48,112 +68,167 @@ def update_status(**kwargs):
         status.update(kwargs)
 
 
+# =====================================
+# Vercel天気API
+# =====================================
+
 def get_weather(city_id):
-    """Vercelの天気APIから天気情報を取得する"""
     query = urllib.parse.urlencode({"city": city_id})
     url = f"{WEATHER_API_URL}?{query}"
 
-    req = urllib.request.Request(
+    request = urllib.request.Request(
         url,
         headers={
             "Authorization": f"Bearer {WEATHER_API_SECRET}",
             "User-Agent": "ScratchWeatherWorker/1.0",
         },
+        method="GET",
     )
 
-    with urllib.request.urlopen(req, timeout=25) as response:
-        return json.loads(response.read().decode("utf-8"))
+    log(f"[WEATHER API] リクエスト送信: city={city_id}")
 
+    with urllib.request.urlopen(request, timeout=30) as response:
+        body = response.read().decode("utf-8")
+        result = json.loads(body)
+
+    for key in RESULT_VARS:
+        if key not in result:
+            raise ValueError(f"API応答に {key} がありません")
+
+    log("[WEATHER API] 取得成功")
+    return result
+
+
+# =====================================
+# Scratchリクエスト処理
+# =====================================
 
 def handle_request(cloud, request_id):
     global last_request_id
 
-    # 同じリクエストの重複処理を防ぐ
+    # 重複リクエストを処理しない
     with request_lock:
         if request_id == last_request_id:
+            log(f"[SKIP] 処理済みリクエスト: req={request_id}")
             return
 
         last_request_id = request_id
+
+    update_status(
+        last_request=str(request_id),
+        message="リクエストを受信しました",
+        last_error=None,
+    )
+
+    try:
+        log(f"[REQUEST] 処理開始: req={request_id}")
+
+        # 選択された都道府県IDを取得
+        city_value = cloud.get_var(CITY_VAR)
+        log(f"[CITY] cityの値: {city_value!r}")
+
+        city_id = int(city_value)
+
+        if not 1 <= city_id <= 47:
+            raise ValueError(
+                f"cityは1～47で指定してください: {city_id}"
+            )
+
+        update_status(message="天気を取得しています")
+
+        # Vercel APIから天気を取得
+        result = get_weather(city_id)
+
+        # 天気情報をScratchのクラウド変数へ保存
+        values = {
+            "current": str(result["current"]),
+            "day1": str(result["day1"]),
+            "day2": str(result["day2"]),
+            "day3": str(result["day3"]),
+        }
+
+        log("[SCRATCH] 天気データを書き込みます")
+
+        cloud.set_vars(values, intelligent_waits=True)
+
+        log("[SCRATCH] 天気データの書き込み完了")
+
+        # 全データを書いたあとで完了番号を更新
+        cloud.set_var(DONE_VAR, str(request_id))
+
+        log(f"[DONE] req={request_id}, done={request_id}")
+
         update_status(
-            last_request=str(request_id),
-            message="天気を取得しています",
+            last_success=datetime.now(timezone.utc).isoformat(),
+            message="天気取得成功",
             last_error=None,
         )
 
-        try:
-            city_value = cloud.get_var(CITY_VAR)
-            city_id = int(city_value)
+    except Exception as exc:
+        error = repr(exc)
+        log(f"[ERROR] リクエスト処理失敗: {error}")
 
-            # 都道府県IDは1～47
-            if city_id < 1 or city_id > 47:
-                raise ValueError(
-                    f"都道府県IDが範囲外です: {city_id}"
-                )
+        update_status(
+            message="天気取得に失敗しました",
+            last_error=error,
+        )
 
-            print(
-                f"[{datetime.now().isoformat()}] "
-                f"天気取得開始: req={request_id}, city={city_id}"
-            )
 
-            result = get_weather(city_id)
-
-            # Vercel APIから4つの数値を受け取る
-            values = {
-                "current": str(result["current"]),
-                "day1": str(result["day1"]),
-                "day2": str(result["day2"]),
-                "day3": str(result["day3"]),
-            }
-
-            # 結果をクラウド変数に保存
-            cloud.set_vars(values, intelligent_waits=True)
-
-            # 最後に完了番号を更新
-            cloud.set_var(DONE_VAR, str(request_id))
-
-            update_status(
-                last_success=datetime.now(timezone.utc).isoformat(),
-                message="天気の取得に成功しました",
-                last_error=None,
-            )
-
-            print(f"天気取得成功: req={request_id}")
-
-        except Exception as exc:
-            error = repr(exc)
-            print(f"天気取得エラー: {error}")
-            update_status(
-                message="天気取得に失敗しました",
-                last_error=error,
-            )
-
+# =====================================
+# Scratch接続・イベント監視
+# =====================================
 
 def scratch_loop():
-    """Scratch接続を開始し、失敗したら再接続を試みる"""
+    global last_request_id
+
     while True:
+        events = None
+
         try:
             update_status(
                 scratch_connected=False,
                 message="Scratchに接続しています",
             )
 
-            print("Scratchにログインしています...")
+            log("[SCRATCH] ログイン開始")
+
             session = sa.login_by_id(
                 SESSION_ID,
                 username=USERNAME,
             )
 
+            log("[SCRATCH] ログイン処理完了")
+
             cloud = session.connect_cloud(PROJECT_ID)
+
+            log(f"[SCRATCH] プロジェクト接続処理完了: {PROJECT_ID}")
+
             events = cloud.events()
 
             @events.event
             def on_set(activity):
+                # すべてのクラウド変数イベントをログに出す
+                log(
+                    f"[CLOUD EVENT] "
+                    f"var={activity.var!r}, "
+                    f"value={activity.value!r}"
+                )
+
+                update_status(
+                    last_event={
+                        "var": str(activity.var),
+                        "value": str(activity.value),
+                        "time": datetime.now(timezone.utc).isoformat(),
+                    }
+                )
+
                 if activity.var != REQUEST_VAR:
                     return
 
                 try:
                     request_id = int(activity.value)
                 except (ValueError, TypeError):
+                    log("[REQUEST] reqが整数ではないため無視します")
                     return
 
                 handle_request(cloud, request_id)
@@ -161,109 +236,121 @@ def scratch_loop():
             @events.event
             def on_ready():
                 now = datetime.now(timezone.utc).isoformat()
+
                 update_status(
                     scratch_connected=True,
                     last_connected=now,
-                    message="Scratchに接続しています",
+                    message="Scratch Cloud Events接続完了",
+                    last_error=None,
                 )
-                print("Scratch Cloud Events 接続完了")
 
-            print("Cloud Eventsを開始します...")
+                log("[SCRATCH] Cloud Events 接続完了")
+
+            log("[SCRATCH] Cloud Eventsを開始します")
             events.start()
 
-            # events.start() が戻っても監視プロセスを維持
+            # start()が戻った場合も接続状態を確認できるようにする
             while True:
                 time.sleep(30)
 
         except Exception as exc:
             error = repr(exc)
-            print("Scratch接続エラー:", error)
+
+            log(f"[SCRATCH ERROR] {error}")
 
             update_status(
                 scratch_connected=False,
-                message="Scratchへの接続に失敗。再接続します",
+                message="Scratch接続エラー。再接続を試みます",
                 last_error=error,
             )
 
+            # 接続失敗時は少し待って再試行
             time.sleep(15)
 
 
+# =====================================
+# 動作確認ページ
+# =====================================
+
 @app.route("/")
 def index():
-    """ブラウザで開く動作確認ページ"""
     return """
-    <!DOCTYPE html>
-    <html lang="ja">
-    <head>
-      <meta charset="UTF-8">
-      <meta name="viewport" content="width=device-width, initial-scale=1">
-      <title>Scratch天気サーバー</title>
-      <style>
-        body {
-          font-family: sans-serif;
-          max-width: 700px;
-          margin: 40px auto;
-          padding: 0 18px;
-          color: #222;
-          background: #f7f9fc;
-        }
-        .panel {
-          background: white;
-          padding: 24px;
-          border-radius: 14px;
-          box-shadow: 0 2px 12px #0001;
-        }
-        .status { margin: 12px 0; }
-        a { color: #1769aa; }
-        button {
-          padding: 10px 16px;
-          border: 0;
-          border-radius: 8px;
-          background: #1769aa;
-          color: white;
-          cursor: pointer;
-        }
-        pre { white-space: pre-wrap; overflow-wrap: anywhere; }
-      </style>
-    </head>
-    <body>
-      <div class="panel">
-        <h1>Scratch天気サーバー</h1>
-        <p>Webサーバーは起動しています。</p>
-        <div id="status">状態を確認しています...</div>
-        <button onclick="checkStatus()">状態を更新</button>
-        <p><a href="/health">ヘルスチェックAPI</a></p>
-      </div>
-      <script>
-        async function checkStatus() {
-          const el = document.getElementById("status");
-          el.textContent = "確認中...";
-          try {
-            const res = await fetch("/health", {cache: "no-store"});
-            const data = await res.json();
-            el.innerHTML = "";
-            const pre = document.createElement("pre");
-            pre.textContent = JSON.stringify(data, null, 2);
-            el.appendChild(pre);
-          } catch (e) {
-            el.textContent = "状態を取得できませんでした: " + e;
-          }
-        }
-        checkStatus();
-        setInterval(checkStatus, 30000);
-      </script>
-    </body>
-    </html>
-    """
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Scratch天気サーバー</title>
+<style>
+body {
+    font-family: sans-serif;
+    max-width: 760px;
+    margin: 35px auto;
+    padding: 0 18px;
+    color: #222;
+    background: #f5f7fb;
+}
+.panel {
+    background: white;
+    padding: 24px;
+    border-radius: 14px;
+    box-shadow: 0 2px 12px #0001;
+}
+button {
+    padding: 10px 16px;
+    border: 0;
+    border-radius: 8px;
+    background: #1769aa;
+    color: white;
+    cursor: pointer;
+}
+pre {
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+}
+a {
+    color: #1769aa;
+}
+</style>
+</head>
+<body>
+<div class="panel">
+    <h1>Scratch天気サーバー</h1>
+    <p>Webサーバーは起動しています。</p>
+    <p>Scratch接続状態とイベント受信状況を確認できます。</p>
+    <button onclick="checkStatus()">状態を更新</button>
+    <p><a href="/health">JSON形式で確認する</a></p>
+    <div id="result">確認中...</div>
+</div>
+<script>
+async function checkStatus() {
+    const result = document.getElementById("result");
+    result.textContent = "確認中...";
+    try {
+        const response = await fetch("/health", {
+            cache: "no-store"
+        });
+        const data = await response.json();
+        const pre = document.createElement("pre");
+        pre.textContent = JSON.stringify(data, null, 2);
+        result.replaceChildren(pre);
+    } catch (error) {
+        result.textContent = "取得失敗: " + error;
+    }
+}
+checkStatus();
+setInterval(checkStatus, 30000);
+</script>
+</body>
+</html>
+"""
 
 
 @app.route("/health")
 def health():
-    """監視サービス向けの状態確認API"""
     with status_lock:
         snapshot = dict(status)
 
-    # Webが応答していることと、Scratch接続状態を分けて返す
     return jsonify({
         "ok": True,
         "server_time": datetime.now(timezone.utc).isoformat(),
@@ -271,12 +358,24 @@ def health():
     })
 
 
-if __name__ == "__main__":
-    # Scratch接続処理をバックグラウンドスレッドで開始
-    thread = threading.Thread(target=scratch_loop, daemon=True)
-    thread.start()
+@app.route("/favicon.ico")
+def favicon():
+    return "", 204
 
-    # Renderから指定されたポートでWebサーバーを起動
+
+# =====================================
+# 起動
+# =====================================
+
+if __name__ == "__main__":
+    log("[SERVER] Scratch天気サーバー起動")
+
+    threading.Thread(
+        target=scratch_loop,
+        daemon=True,
+        name="scratch-cloud-events",
+    ).start()
+
     app.run(
         host="0.0.0.0",
         port=PORT,
