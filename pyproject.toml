@@ -1,1 +1,2 @@
-[tool.vercel] entrypoint = "api.weather:handler"
+[tool.vercel]
+entrypoint = "api.weather:handler"
