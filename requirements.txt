@@ -1,1 +1,2 @@
-scratchattach
+scratchattach==2.2.5
+Flask
