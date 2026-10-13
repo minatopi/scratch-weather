@@ -5,6 +5,7 @@ import json
 import threading
 import urllib.parse
 import urllib.request
+import urllib.error
 from datetime import datetime, timezone
 
 import scratchattach as sa
@@ -26,7 +27,7 @@ WEATHER_API_URL = os.environ["WEATHER_API_URL"].rstrip("/")
 WEATHER_API_SECRET = os.environ["WEATHER_API_SECRET"]
 
 # =====================================
-# Scratchのクラウド変数名
+# Scratchのクラウド変数
 # =====================================
 
 REQUEST_VAR = "req"
@@ -53,12 +54,10 @@ status = {
 status_lock = threading.Lock()
 request_lock = threading.Lock()
 
-# 同一プロセス内での重複処理を防止
 last_request_id = None
 
 
 def log(message):
-    """時刻付きログ"""
     now = datetime.now(timezone.utc).isoformat()
     print(f"[{now}] {message}", flush=True)
 
@@ -73,27 +72,93 @@ def update_status(**kwargs):
 # =====================================
 
 def get_weather(city_id):
+    # cityパラメータを追加
+    separator = "&" if "?" in WEATHER_API_URL else "?"
     query = urllib.parse.urlencode({"city": city_id})
-    url = f"{WEATHER_API_URL}?{query}"
+    url = f"{WEATHER_API_URL}{separator}{query}"
 
     request = urllib.request.Request(
         url,
         headers={
             "Authorization": f"Bearer {WEATHER_API_SECRET}",
+            "Accept": "application/json",
             "User-Agent": "ScratchWeatherWorker/1.0",
         },
         method="GET",
     )
 
+    # シークレットはログに出さない
     log(f"[WEATHER API] リクエスト送信: city={city_id}")
+    log(f"[WEATHER API] 接続先: {url}")
 
-    with urllib.request.urlopen(request, timeout=30) as response:
-        body = response.read().decode("utf-8")
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            http_status = response.status
+            content_type = response.headers.get("Content-Type", "")
+            body = response.read().decode("utf-8", errors="replace")
+
+    except urllib.error.HTTPError as exc:
+        # 401、403、404、500などの本文を確認
+        error_body = exc.read().decode(
+            "utf-8", errors="replace"
+        )
+
+        log(f"[WEATHER API ERROR] HTTPステータス: {exc.code}")
+        log(f"[WEATHER API ERROR] Content-Type: "
+            f"{exc.headers.get('Content-Type', '')}")
+        log(f"[WEATHER API ERROR] 本文: {error_body[:1500]!r}")
+
+        raise RuntimeError(
+            f"天気APIのHTTPエラー: {exc.code}; "
+            f"本文={error_body[:500]!r}"
+        ) from exc
+
+    except Exception as exc:
+        log(f"[WEATHER API ERROR] 通信エラー: {exc!r}")
+        raise
+
+    log(f"[WEATHER API] HTTPステータス: {http_status}")
+    log(f"[WEATHER API] Content-Type: {content_type}")
+    log(f"[WEATHER API] レスポンス長: {len(body)}文字")
+
+    # 空のレスポンスを明示的に検出
+    if not body.strip():
+        raise RuntimeError(
+            "天気APIのレスポンスが空です。"
+            f" HTTP={http_status}, Content-Type={content_type}"
+        )
+
+    # JSONとして解析
+    try:
         result = json.loads(body)
+    except json.JSONDecodeError as exc:
+        log(f"[WEATHER API ERROR] JSON解析失敗: {exc}")
+        log(f"[WEATHER API ERROR] レスポンス本文: {body[:1500]!r}")
+
+        raise RuntimeError(
+            "天気APIがJSON以外の応答を返しました。"
+            f" HTTP={http_status}, Content-Type={content_type}, "
+            f"本文={body[:500]!r}"
+        ) from exc
+
+    if not isinstance(result, dict):
+        raise ValueError(
+            f"API応答がJSONオブジェクトではありません: "
+            f"{type(result).__name__}"
+        )
+
+    # API側がエラーをJSONで返した場合も検出
+    if result.get("error"):
+        raise RuntimeError(
+            f"天気APIのエラー応答: {result['error']!r}"
+        )
 
     for key in RESULT_VARS:
         if key not in result:
-            raise ValueError(f"API応答に {key} がありません")
+            raise ValueError(
+                f"API応答に {key} がありません。"
+                f" 応答キー={list(result.keys())}"
+            )
 
     log("[WEATHER API] 取得成功")
     return result
@@ -106,7 +171,7 @@ def get_weather(city_id):
 def handle_request(cloud, request_id):
     global last_request_id
 
-    # 重複リクエストを処理しない
+    # 同じreqの重複処理を防ぐ
     with request_lock:
         if request_id == last_request_id:
             log(f"[SKIP] 処理済みリクエスト: req={request_id}")
@@ -123,7 +188,6 @@ def handle_request(cloud, request_id):
     try:
         log(f"[REQUEST] 処理開始: req={request_id}")
 
-        # 選択された都道府県IDを取得
         city_value = cloud.get_var(CITY_VAR)
         log(f"[CITY] cityの値: {city_value!r}")
 
@@ -136,10 +200,8 @@ def handle_request(cloud, request_id):
 
         update_status(message="天気を取得しています")
 
-        # Vercel APIから天気を取得
         result = get_weather(city_id)
 
-        # 天気情報をScratchのクラウド変数へ保存
         values = {
             "current": str(result["current"]),
             "day1": str(result["day1"]),
@@ -148,12 +210,10 @@ def handle_request(cloud, request_id):
         }
 
         log("[SCRATCH] 天気データを書き込みます")
-
         cloud.set_vars(values, intelligent_waits=True)
-
         log("[SCRATCH] 天気データの書き込み完了")
 
-        # 全データを書いたあとで完了番号を更新
+        # 全データを書き込んでから完了番号を更新
         cloud.set_var(DONE_VAR, str(request_id))
 
         log(f"[DONE] req={request_id}, done={request_id}")
@@ -174,9 +234,8 @@ def handle_request(cloud, request_id):
         )
 
 
-
 # =====================================
-# Scratch接続・イベント監視
+# Scratch接続・Cloud Events
 # =====================================
 
 def scratch_loop():
@@ -196,14 +255,13 @@ def scratch_loop():
 
             log("[SCRATCH] ログイン処理完了")
 
-            # イベント監視専用の接続
+            # Cloud Events専用接続
             event_cloud = session.connect_cloud(PROJECT_ID)
-            log(f"[SCRATCH] イベント監視用接続完了: {PROJECT_ID}")
+            log(f"[SCRATCH] イベント接続完了: {PROJECT_ID}")
 
-            # クラウド変数の読み書き専用の別接続
-            # イベント監視中の接続で get_var / set_var を行わない
+            # クラウド変数の読み書き用接続
             data_cloud = session.connect_cloud(PROJECT_ID)
-            log("[SCRATCH] データ処理用接続完了")
+            log("[SCRATCH] データ接続完了")
 
             events = event_cloud.events()
 
@@ -221,7 +279,9 @@ def scratch_loop():
                     last_event={
                         "var": str(var_name),
                         "value": str(value),
-                        "time": datetime.now(timezone.utc).isoformat(),
+                        "time": datetime.now(
+                            timezone.utc
+                        ).isoformat(),
                     }
                 )
 
@@ -234,8 +294,7 @@ def scratch_loop():
                     log("[REQUEST] reqが整数ではないため無視します")
                     return
 
-                # イベント受信をブロックしないよう、
-                # 天気取得は別スレッドで実行する
+                # イベント受信をブロックしない
                 threading.Thread(
                     target=handle_request,
                     args=(data_cloud, request_id),
@@ -259,13 +318,11 @@ def scratch_loop():
             log("[SCRATCH] Cloud Eventsを開始します")
             events.start()
 
-            # イベント監視を維持
             while True:
                 time.sleep(30)
 
         except Exception as exc:
             error = repr(exc)
-
             log(f"[SCRATCH ERROR] {error}")
 
             update_status(
@@ -278,7 +335,7 @@ def scratch_loop():
 
 
 # =====================================
-# 動作確認ページ
+# ステータスページ
 # =====================================
 
 @app.route("/")
@@ -317,9 +374,7 @@ pre {
     white-space: pre-wrap;
     overflow-wrap: anywhere;
 }
-a {
-    color: #1769aa;
-}
+a { color: #1769aa; }
 </style>
 </head>
 <body>
