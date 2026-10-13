@@ -174,16 +174,13 @@ def handle_request(cloud, request_id):
         )
 
 
+
 # =====================================
 # Scratch接続・イベント監視
 # =====================================
 
 def scratch_loop():
-    global last_request_id
-
     while True:
-        events = None
-
         try:
             update_status(
                 scratch_connected=False,
@@ -199,39 +196,52 @@ def scratch_loop():
 
             log("[SCRATCH] ログイン処理完了")
 
-            cloud = session.connect_cloud(PROJECT_ID)
+            # イベント監視専用の接続
+            event_cloud = session.connect_cloud(PROJECT_ID)
+            log(f"[SCRATCH] イベント監視用接続完了: {PROJECT_ID}")
 
-            log(f"[SCRATCH] プロジェクト接続処理完了: {PROJECT_ID}")
+            # クラウド変数の読み書き専用の別接続
+            # イベント監視中の接続で get_var / set_var を行わない
+            data_cloud = session.connect_cloud(PROJECT_ID)
+            log("[SCRATCH] データ処理用接続完了")
 
-            events = cloud.events()
+            events = event_cloud.events()
 
             @events.event
             def on_set(activity):
-                # すべてのクラウド変数イベントをログに出す
+                var_name = activity.var
+                value = activity.value
+
                 log(
                     f"[CLOUD EVENT] "
-                    f"var={activity.var!r}, "
-                    f"value={activity.value!r}"
+                    f"var={var_name!r}, value={value!r}"
                 )
 
                 update_status(
                     last_event={
-                        "var": str(activity.var),
-                        "value": str(activity.value),
+                        "var": str(var_name),
+                        "value": str(value),
                         "time": datetime.now(timezone.utc).isoformat(),
                     }
                 )
 
-                if activity.var != REQUEST_VAR:
+                if var_name != REQUEST_VAR:
                     return
 
                 try:
-                    request_id = int(activity.value)
+                    request_id = int(value)
                 except (ValueError, TypeError):
                     log("[REQUEST] reqが整数ではないため無視します")
                     return
 
-                handle_request(cloud, request_id)
+                # イベント受信をブロックしないよう、
+                # 天気取得は別スレッドで実行する
+                threading.Thread(
+                    target=handle_request,
+                    args=(data_cloud, request_id),
+                    daemon=True,
+                    name=f"weather-request-{request_id}",
+                ).start()
 
             @events.event
             def on_ready():
@@ -249,7 +259,7 @@ def scratch_loop():
             log("[SCRATCH] Cloud Eventsを開始します")
             events.start()
 
-            # start()が戻った場合も接続状態を確認できるようにする
+            # イベント監視を維持
             while True:
                 time.sleep(30)
 
@@ -264,7 +274,6 @@ def scratch_loop():
                 last_error=error,
             )
 
-            # 接続失敗時は少し待って再試行
             time.sleep(15)
 
 
