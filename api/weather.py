@@ -50,15 +50,9 @@ def pack_day(high, low, code):
     )
 
 
+
 class handler(BaseHTTPRequestHandler):
     def do_GET(self):
-        secret = os.environ.get("WEATHER_API_SECRET", "")
-        auth = self.headers.get("Authorization", "")
-
-        if not secret or auth != "Bearer " + secret:
-            self.send_error(401)
-            return
-
         try:
             from urllib.parse import urlparse, parse_qs
 
@@ -70,6 +64,7 @@ class handler(BaseHTTPRequestHandler):
                 return
 
             lat, lon = CITIES[city_id]
+
 
             params = urllib.parse.urlencode({
                 "latitude": lat,
