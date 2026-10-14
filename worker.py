@@ -77,15 +77,16 @@ def get_weather(city_id):
     query = urllib.parse.urlencode({"city": city_id})
     url = f"{WEATHER_API_URL}{separator}{query}"
 
+
     request = urllib.request.Request(
         url,
         headers={
-            "Authorization": f"Bearer {WEATHER_API_SECRET}",
             "Accept": "application/json",
             "User-Agent": "ScratchWeatherWorker/1.0",
         },
         method="GET",
     )
+
 
     # シークレットはログに出さない
     log(f"[WEATHER API] リクエスト送信: city={city_id}")
